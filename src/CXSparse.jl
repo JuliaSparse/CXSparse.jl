@@ -1,42 +1,10 @@
-"""
-    CXSparse
-
-Julia wrapper around the CXSparse library from SuiteSparse — the lightweight,
-textbook-style sparse direct solver from Tim Davis's *Direct Methods for
-Sparse Linear Systems* (CSparse), extended to support `ComplexF64` values and
-both 32- and 64-bit indices.
-
-CXSparse is the QR / LU / Cholesky counterpart to KLU's design philosophy: a
-small symbolic-phase cost and very little per-call overhead, well-suited to
-small-to-medium sparse problems (n up to a few thousand). It complements the
-multifrontal solvers (UMFPACK, SPQR, CHOLMOD) which pay a heavier symbolic
-tax in exchange for BLAS-3 speedups on larger fronts.
-
-Supported element / index combinations:
-
-| element type   | index type | CXSparse name |
-|----------------|------------|---------------|
-| `Float64`      | `Int32`    | `cs_di_*`     |
-| `Float64`      | `Int64`    | `cs_dl_*`     |
-| `ComplexF64`   | `Int32`    | `cs_ci_*`     |
-| `ComplexF64`   | `Int64`    | `cs_cl_*`     |
-
-Public API:
-  - `cs_qr(A)` — symbolic + numeric QR factorization; returns a `CSQR`.
-  - `F \\ b`, `ldiv!(x, F, b)` — least-squares solve using a `CSQR`.
-  - `cs_lu(A)` — symbolic + numeric LU factorization; returns a `CSLU`.
-  - `F \\ b`, `ldiv!(x, F, b)` — solve using a `CSLU`.
-
-C-side memory is freed when the Julia factorization object is garbage
-collected; explicit `finalize(F)` is also supported.
-"""
 module CXSparse
 
 using CXSparse_jll: libcxsparse
 using LinearAlgebra
 using SparseArrays: SparseArrays, SparseMatrixCSC, getcolptr, rowvals, nonzeros
 
-export cs_qr, cs_lu, CSQR, CSLU
+export cs_qr, cs_lu, cs_cholesky, CSQR, CSLU, CSCholesky
 
 # CXSparse uses 0-based column orderings; pick COLAMD-ish ordering for QR.
 # The CSparse `order` argument: 0 = natural, 1 = AMD(A+A'), 2 = AMD(S'S),
@@ -44,6 +12,8 @@ export cs_qr, cs_lu, CSQR, CSLU
 const CS_ORDER_QR = Int32(3)
 # For LU: 2 = AMD(S'S) — Davis's recommended choice for unsymmetric LU.
 const CS_ORDER_LU = Int32(2)
+# For Cholesky: 1 = AMD(A+A') — symmetric ordering.
+const CS_ORDER_CHOL = Int32(1)
 # LU pivoting tolerance: 1.0 = strict partial pivoting; smaller values relax it.
 const CS_LU_TOL = 1.0
 
@@ -515,6 +485,153 @@ function LinearAlgebra.ldiv!(
 end
 
 function Base.:\(F::CSLU{Tv,Ti,T_sp}, b::AbstractVector{Tv}) where {Tv,Ti,T_sp}
+    x = Vector{Tv}(undef, F.n)
+    return ldiv!(x, F, b)
+end
+
+# ---------------------------------------------------------------------------
+# Cholesky (symmetric/Hermitian positive definite)
+# ---------------------------------------------------------------------------
+# CXSparse's `cs_*_chol` produces a lower-triangular L with L*L' = P*A*P',
+# where P is the AMD(A+A') fill-reducing permutation stored in S->pinv.
+# Only the upper triangle of A is read; the matrix is assumed symmetric
+# (for Float64) or Hermitian (for ComplexF64).
+"""
+    CSCholesky{Tv,Ti}
+
+Symbolic + numeric CXSparse Cholesky factorization of a square symmetric
+(real) or Hermitian (complex) positive-definite `SparseMatrixCSC{Tv,Ti}`.
+Holds opaque pointers to the C-side `cs_*s` symbolic and `cs_*n` numeric
+structs; freed by a finalizer or explicit `finalize`.
+"""
+mutable struct CSCholesky{Tv,Ti,T_sp}
+    view::_CSView{T_sp,Tv,Ti}
+    S::Ptr{Cvoid}
+    N::Ptr{Cvoid}
+    n::Int
+end
+
+for (Tv, Ti, tag) in (
+        (Float64, Int32, :di),
+        (Float64, Int64, :dl),
+        (ComplexF64, Int32, :ci),
+        (ComplexF64, Int64, :cl),
+    )
+    sparse_ty = Symbol("cs_$(tag)")
+    schol_sym = "cs_$(tag)_schol"
+    chol_sym = "cs_$(tag)_chol"
+    ltsolve_sym = "cs_$(tag)_ltsolve"
+    pvec_sym = "cs_$(tag)_pvec"
+
+    @eval begin
+        function _cs_schol(view::_CSView{$sparse_ty,$Tv,$Ti})
+            return @ccall libcxsparse.$schol_sym(
+                CS_ORDER_CHOL::$Ti,
+                Ref(view.sparse)::Ref{$sparse_ty},
+            )::Ptr{Cvoid}
+        end
+        function _cs_chol(view::_CSView{$sparse_ty,$Tv,$Ti}, S::Ptr{Cvoid})
+            return @ccall libcxsparse.$chol_sym(
+                Ref(view.sparse)::Ref{$sparse_ty},
+                S::Ptr{Cvoid},
+            )::Ptr{Cvoid}
+        end
+        function _cs_ltsolve!(::Type{$Ti}, L::Ptr{Cvoid}, b::AbstractVector{$Tv})
+            @ccall libcxsparse.$ltsolve_sym(
+                L::Ptr{Cvoid},
+                pointer(b)::Ptr{$Tv},
+            )::$Ti
+        end
+        function _cs_pvec!(
+                p::Ptr{$Ti},
+                b::AbstractVector{$Tv},
+                x::AbstractVector{$Tv},
+                n::Integer,
+            )
+            @ccall libcxsparse.$pvec_sym(
+                p::Ptr{$Ti},
+                pointer(b)::Ptr{$Tv},
+                pointer(x)::Ptr{$Tv},
+                $Ti(n)::$Ti,
+            )::$Ti
+        end
+    end
+end
+
+"""
+    cs_cholesky(A::SparseMatrixCSC) -> CSCholesky
+
+Compute the symbolic and numeric CXSparse Cholesky factorization of `A`.
+`A` must be square and symmetric (real) or Hermitian (complex) positive
+definite. Only the upper triangle of `A` is read.
+
+Throws if the factorization fails (typically: `A` is not positive definite,
+or numerical breakdown encountered a non-positive pivot).
+
+Solve with `F \\ b` or `ldiv!(x, F, b)`.
+"""
+function cs_cholesky end
+
+for (Tv, Ti, tag) in (
+        (Float64, Int32, :di),
+        (Float64, Int64, :dl),
+        (ComplexF64, Int32, :ci),
+        (ComplexF64, Int64, :cl),
+    )
+    sparse_ty = Symbol("cs_$(tag)")
+    @eval function cs_cholesky(A::SparseMatrixCSC{$Tv,$Ti})
+        m, n = size(A)
+        m == n || error(
+            "CXSparse cs_cholesky requires a square matrix; got $(size(A))")
+        view = _csview(A)
+        S = _cs_schol(view)
+        S == C_NULL && error("CXSparse cs_*_schol returned NULL")
+        N = _cs_chol(view, S)
+        if N == C_NULL
+            _cs_sfree($Tv, $Ti, S)
+            error("CXSparse cs_*_chol returned NULL — matrix not positive " *
+                  "definite (or not symmetric/Hermitian)?")
+        end
+        F = CSCholesky{$Tv,$Ti,$sparse_ty}(view, S, N, n)
+        finalizer(_finalize_chol!, F)
+        return F
+    end
+end
+
+function _finalize_chol!(F::CSCholesky{Tv,Ti,T_sp}) where {Tv,Ti,T_sp}
+    _cs_sfree(Tv, Ti, F.S); _cs_nfree(Tv, Ti, F.N)
+    F.S = C_NULL; F.N = C_NULL
+    return nothing
+end
+
+Base.size(F::CSCholesky) = (F.n, F.n)
+Base.size(F::CSCholesky, d::Integer) = d == 1 || d == 2 ? F.n : 1
+
+function LinearAlgebra.ldiv!(
+        x::AbstractVector{Tv},
+        F::CSCholesky{Tv,Ti,T_sp},
+        b::AbstractVector{Tv},
+    ) where {Tv,Ti,T_sp}
+    n = F.n
+    length(b) == n || throw(DimensionMismatch(
+        "rhs has length $(length(b)), expected $n"))
+    length(x) == n || throw(DimensionMismatch(
+        "solution has length $(length(x)), expected $n"))
+    work = Vector{Tv}(undef, n)
+    Spinv = _cs_S_pinv(Tv, Ti, F.S)
+    L = _cs_N_L(Tv, Ti, F.N)
+    # work = P*b
+    _cs_ipvec!(Spinv, b, work, n)
+    # work = L \ work
+    _cs_lsolve!(Ti, L, work)
+    # work = L' \ work
+    _cs_ltsolve!(Ti, L, work)
+    # x = P' * work
+    _cs_pvec!(Spinv, work, x, n)
+    return x
+end
+
+function Base.:\(F::CSCholesky{Tv,Ti,T_sp}, b::AbstractVector{Tv}) where {Tv,Ti,T_sp}
     x = Vector{Tv}(undef, F.n)
     return ldiv!(x, F, b)
 end
