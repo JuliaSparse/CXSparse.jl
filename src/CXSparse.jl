@@ -1,7 +1,7 @@
 module CXSparse
 
 using CXSparse_jll: libcxsparse
-using LinearAlgebra
+using LinearAlgebra: LinearAlgebra, ldiv!
 using SparseArrays: SparseArrays, SparseMatrixCSC, getcolptr, rowvals, nonzeros
 
 export cs_qr, cs_lu, cs_cholesky, CSQR, CSLU, CSCholesky
