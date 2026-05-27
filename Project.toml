@@ -1,0 +1,22 @@
+name = "CXSparse"
+uuid = "27bc1049-af5b-4e6d-9573-9751c3395f6e"
+authors = ["Chris Rackauckas <accounts@chrisrackauckas.com> and contributors"]
+version = "0.1.0"
+
+[deps]
+CXSparse_jll = "c77e7b6a-7cf9-58ed-a396-e1da12b05d87"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+
+[compat]
+CXSparse_jll = "4"
+LinearAlgebra = "1"
+SparseArrays = "1"
+julia = "1.10"
+
+[extras]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Random", "Test"]
