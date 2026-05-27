@@ -10,7 +10,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [compat]
 Aqua = "0.8"
-CXSparse_jll = "4"
+CXSparse_jll = "4, 400"
 ExplicitImports = "1"
 LinearAlgebra = "1"
 Random = "1"
